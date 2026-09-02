@@ -2,34 +2,35 @@
 shopify_data.py
 ---------------
 Motor de datos del dashboard de reposición. Lee EN VIVO de cada tienda Shopify:
-
+ 
   - Productos + variantes (modelo, color, talle, SKU, stock)  -> /products.json
   - Ventas por variante en una ventana de días                -> /orders.json
-
+ 
 y arma una tabla por variante con: unidades vendidas, velocidad (u/día),
 stock actual, días de cobertura y sugerido de reposición.
-
+ 
 Requiere en cada token los scopes: read_products, read_orders, read_inventory.
 """
-
+ 
 from __future__ import annotations
-
+ 
 import re
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable
-
+ 
+import numpy as np
 import pandas as pd
 import requests
-
+ 
 API_VERSION = "2025-01"
-
-
+ 
+ 
 class ShopifyDataError(RuntimeError):
     pass
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # SKU modelo+color (misma lógica robusta del otro repo)
 # ---------------------------------------------------------------------------
@@ -39,13 +40,13 @@ _SIZE_TOKEN = re.compile(
     r"^(\d+([.,]\d+)?[A-Za-z]{0,2}"
     r"|[A-Za-z]{0,3}\d+([.,]\d+)?(/[A-Za-z]{0,3}\d+([.,]\d+)?)+)$"
 )
-
-
+ 
+ 
 def _looks_like_size(t: str) -> bool:
     t = (t or "").strip()
     return bool(t) and bool(_SIZE_TOKEN.match(t))
-
-
+ 
+ 
 def _detect_positions(options: list) -> tuple[int | None, int | None]:
     color_pos = size_pos = None
     for o in options or []:
@@ -56,19 +57,19 @@ def _detect_positions(options: list) -> tuple[int | None, int | None]:
         if size_pos is None and any(h in name for h in _SIZE_HINTS):
             size_pos = pos
     return color_pos, size_pos
-
-
+ 
+ 
 def _vopt(v: dict, pos: int | None) -> str:
     return (v.get(f"option{pos}") or "").strip() if pos else ""
-
-
+ 
+ 
 def _strip_last_if_talle(sku: str, talle: str) -> str:
     s, t = (sku or "").strip(), (talle or "").strip()
     if t and s.upper().endswith(t.upper()):
         s = s[: len(s) - len(t)].rstrip(" -_/.·")
     return s
-
-
+ 
+ 
 def _base_sku_color(pares: list[tuple[str, str]]) -> str:
     skus = [s.strip() for _, s in pares if s and s.strip()]
     if not skus:
@@ -91,8 +92,8 @@ def _base_sku_color(pares: list[tuple[str, str]]) -> str:
         else:
             break
     return "-".join(comunes).rstrip(" -_/.·") or skus[0]
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Cliente REST
 # ---------------------------------------------------------------------------
@@ -102,7 +103,7 @@ class ShopifyRest:
         self.session = requests.Session()
         self.session.headers.update({"X-Shopify-Access-Token": token,
                                      "Content-Type": "application/json"})
-
+ 
     def _get(self, url: str, params: dict | None):
         for attempt in range(6):
             r = self.session.get(url, params=params, timeout=60)
@@ -120,7 +121,7 @@ class ShopifyRest:
                 raise ShopifyDataError(f"{self.shop}: HTTP {r.status_code} - {r.text[:200]}")
             return r
         raise ShopifyDataError(f"{self.shop}: demasiados reintentos.")
-
+ 
     def paginate(self, path: str, params: dict, root_key: str):
         url = f"https://{self.shop}/admin/api/{API_VERSION}/{path}"
         while True:
@@ -132,8 +133,8 @@ class ShopifyRest:
             if not nxt:
                 break
             url, params = nxt, None
-
-
+ 
+ 
 def _next_link(link_header: str) -> str | None:
     for part in (link_header or "").split(","):
         if 'rel="next"' in part:
@@ -141,8 +142,8 @@ def _next_link(link_header: str) -> str | None:
             if i != -1 and j != -1:
                 return part[i + 1:j]
     return None
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Fetch por tienda
 # ---------------------------------------------------------------------------
@@ -164,7 +165,7 @@ def fetch_variants(store: str, shop_url: str, token: str) -> list[dict]:
             ) or "(sin color)"
             por_color[color].append(((_vopt(v, size_pos)), (v.get("sku") or "").strip()))
         base_por_color = {c: _base_sku_color(pares) for c, pares in por_color.items()}
-
+ 
         for v in variants:
             color = _vopt(v, color_pos) or (
                 "" if (v.get("title") or "").lower() == "default title" else (v.get("title") or "")
@@ -184,8 +185,8 @@ def fetch_variants(store: str, shop_url: str, token: str) -> list[dict]:
                 "Creado": p.get("created_at", ""),
             })
     return filas
-
-
+ 
+ 
 def fetch_sales(store: str, shop_url: str, token: str, days: int, recent_days: int = 3):
     """
     Unidades/ingresos por SKU en la ventana, con sub-ventanas para medir el
@@ -224,8 +225,8 @@ def fetch_sales(store: str, shop_url: str, token: str, days: int, recent_days: i
             if fecha:
                 diario[fecha] += qty
     return por_sku, diario
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Construcción de la tabla + métricas
 # ---------------------------------------------------------------------------
@@ -263,36 +264,39 @@ def build_variant_table(stores: dict, seleccion: list[str], days: int, recent_da
             errores.append(f"{nombre}: {e}")
         if progress_cb:
             progress_cb(f"{nombre} listo ({i+1}/{total})", (i + 1) / total)
-
+ 
     return pd.DataFrame(filas), pd.DataFrame(serie_rows), errores
-
-
+ 
+ 
 def _dias_desde(iso: str) -> float:
     try:
         return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).days
     except Exception:
         return 9999
-
-
+ 
+ 
 INF = float("inf")
-
-
+ 
+ 
 def _metricas(df: pd.DataFrame, days: int, recent_days: int,
               coverage_days: int, lead_days: int, safety_pct: int,
               accel_thr: float, launch_days: int, min_units: int) -> pd.DataFrame:
     """Calcula velocidad base/actual, aceleración, cobertura, reposición y flags."""
-    vel_base = df["Vendidos"] / days
-    vel_act = df["Vend_recientes"] / max(1, recent_days)
+    vel_base = (df["Vendidos"].astype(float) / days)
+    vel_act = (df["Vend_recientes"].astype(float) / max(1, recent_days))
     factor = 1 + safety_pct / 100.0
     # se repone según el ritmo más exigente (base vs actual) para reaccionar a picos
     vel_eff = pd.concat([vel_base, vel_act], axis=1).max(axis=1)
     demanda = vel_eff * (coverage_days + lead_days) * factor
+    # 0 -> NaN (float) para evitar división por cero; NaN = "no vende / cobertura infinita"
+    vb = vel_base.replace(0, np.nan)
+    va = vel_act.replace(0, np.nan)
     df["Velocidad"] = vel_base.round(3)
     df["Vel actual"] = vel_act.round(3)
-    df["Aceleración"] = (vel_act / vel_base.replace(0, pd.NA)).astype(float)
+    df["Aceleración"] = (vel_act / vb).round(2)
     df["Reponer"] = (demanda - df["Stock"]).round().clip(lower=0).astype(int)
-    df["Cobertura"] = (df["Stock"] / vel_base.replace(0, pd.NA)).astype(float).round(1)
-    df["Cobertura actual"] = (df["Stock"] / vel_act.replace(0, pd.NA)).astype(float).round(1)
+    df["Cobertura"] = (df["Stock"] / vb).round(1)
+    df["Cobertura actual"] = (df["Stock"] / va).round(1)
     if "Creado" in df.columns:
         df["Días desde alta"] = df["Creado"].map(_dias_desde)
     else:
@@ -304,8 +308,8 @@ def _metricas(df: pd.DataFrame, days: int, recent_days: int,
                (vel_base.eq(0) & (df["Vend_recientes"] >= min_units))
     df["🚀"] = nuevo & (df["Vend_recientes"] >= min_units)
     return df
-
-
+ 
+ 
 def add_reorder_metrics(df_var: pd.DataFrame, days: int, coverage_days: int, lead_days: int,
                         safety_pct: int = 0, recent_days: int = 3, accel_thr: float = 1.6,
                         launch_days: int = 30, min_units: int = 3) -> pd.DataFrame:
@@ -313,8 +317,8 @@ def add_reorder_metrics(df_var: pd.DataFrame, days: int, coverage_days: int, lea
         return df_var
     return _metricas(df_var.copy(), days, recent_days, coverage_days, lead_days,
                      safety_pct, accel_thr, launch_days, min_units)
-
-
+ 
+ 
 def aggregate_model_color(df_var: pd.DataFrame, days: int, recent_days: int,
                           coverage_days: int, lead_days: int, safety_pct: int,
                           accel_thr: float = 1.6, launch_days: int = 30,
@@ -337,3 +341,5 @@ def aggregate_model_color(df_var: pd.DataFrame, days: int, recent_days: int,
     g = _metricas(g, days, recent_days, coverage_days, lead_days,
                   safety_pct, accel_thr, launch_days, min_units)
     return g.sort_values("Vendidos", ascending=False).reset_index(drop=True)
+ 
+
