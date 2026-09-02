@@ -3,24 +3,24 @@ Dashboard de reposición en vivo — Shopify multi-marca.
 Alarmas de productos que se venden rápido (incl. lanzamientos), Top 10,
 bloques por marca y sugerido de reposición.
 """
-
+ 
 import io
 from datetime import datetime
-
+ 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-
+ 
 from shopify_data import (build_variant_table, add_reorder_metrics,
                           aggregate_model_color, ShopifyDataError)
-
+ 
 st.set_page_config(page_title="Reposición en vivo", page_icon="⚡", layout="wide")
-
+ 
 NEON, NEON2 = "#00e5ff", "#a855f7"
 OK, WARN, BAD, HOT = "#22e0a1", "#ffcf5c", "#ff5c7c", "#ff8a3d"
 BG, CARD = "#0a0e17", "#111827"
-
+ 
 st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Rajdhani:wght@500;600;700&display=swap');
@@ -45,48 +45,44 @@ section[data-testid="stSidebar"] {{ background:#0b1220; border-right:1px solid r
 .stButton>button {{ background:linear-gradient(90deg,{NEON},{NEON2}); color:#05121a; font-weight:700; border:0; border-radius:10px; }}
 </style>
 """, unsafe_allow_html=True)
-
-
+ 
+ 
 def get_stores() -> dict:
     if "stores" not in st.secrets:
         st.error("No hay tiendas en *Secrets* (`[stores.*]`). Ver README.")
         st.stop()
     return {n: {"url": c["url"], "token": c["token"]} for n, c in st.secrets["stores"].items()}
-
-
+ 
+ 
 @st.cache_data(show_spinner=False, ttl=900)
 def load_data(nombres: tuple, days: int, recent_days: int):
+    # OJO: nada de widgets de Streamlit acá adentro (rompe con @st.cache_data).
     stores = get_stores()
-    prog = st.progress(0.0, text="Conectando…")
-    df_var, serie, errores = build_variant_table(
-        stores, list(nombres), days, recent_days,
-        progress_cb=lambda m, f: prog.progress(min(1.0, f), text=m))
-    prog.empty()
-    return df_var, serie, errores
-
-
+    return build_variant_table(stores, list(nombres), days, recent_days)
+ 
+ 
 def kpi(col, label, value, sub=""):
     col.markdown(f'<div class="kpi"><div class="lbl">{label}</div>'
                  f'<div class="val">{value}</div><div class="sub">{sub}</div></div>',
                  unsafe_allow_html=True)
-
-
+ 
+ 
 def miles(n):
     return f"{int(n):,}".replace(",", ".")
-
-
+ 
+ 
 def excel_bytes(hojas: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         for nombre, d in hojas.items():
             d.to_excel(w, index=False, sheet_name=nombre[:31])
     return buf.getvalue()
-
-
+ 
+ 
 # ---------------------------------------------------------------------------
 st.title("⚡ REPOSICIÓN EN VIVO")
 st.caption("Qué se está vendiendo rápido, qué reponer y qué lanzamiento despegó — en vivo.")
-
+ 
 stores = get_stores()
 with st.sidebar:
     st.header("⚙️ Parámetros")
@@ -107,26 +103,35 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
     st.caption("Datos cacheados 15 min. *Refrescar* fuerza la lectura.")
-
+ 
 if not marcas:
     st.warning("Elegí al menos una marca.")
     st.stop()
-
+ 
 try:
-    df_var, serie, errores = load_data(tuple(sorted(marcas)), ventana, reciente)
+    with st.spinner("Leyendo Shopify en vivo…"):
+        df_var, serie, errores = load_data(tuple(sorted(marcas)), ventana, reciente)
 except ShopifyDataError as e:
     st.error(str(e)); st.stop()
+except Exception as e:  # noqa — mostrar el error real (Streamlit Cloud lo redacta si no)
+    st.error(f"Error leyendo datos: {type(e).__name__}: {e}")
+    st.stop()
+ 
 for err in errores:
     st.error(err)
 if df_var is None or df_var.empty:
     st.warning("Sin datos. Revisá tokens/scopes (read_products, read_orders, read_inventory).")
     st.stop()
-
-kw = dict(recent_days=reciente, accel_thr=accel, launch_days=launch, min_units=min_u)
-df_var = add_reorder_metrics(df_var, ventana, cobertura, lead, safety, **kw)
-mc = aggregate_model_color(df_var, ventana, reciente, cobertura, lead, safety,
-                           accel_thr=accel, launch_days=launch, min_units=min_u)
-
+ 
+try:
+    kw = dict(recent_days=reciente, accel_thr=accel, launch_days=launch, min_units=min_u)
+    df_var = add_reorder_metrics(df_var, ventana, cobertura, lead, safety, **kw)
+    mc = aggregate_model_color(df_var, ventana, reciente, cobertura, lead, safety,
+                               accel_thr=accel, launch_days=launch, min_units=min_u)
+except Exception as e:  # noqa
+    st.error(f"Error calculando métricas: {type(e).__name__}: {e}")
+    st.stop()
+ 
 # ---------------------------------------------------------------------------
 # KPIs
 # ---------------------------------------------------------------------------
@@ -137,15 +142,15 @@ kpi(c[2], "🔥 Acelerando", f"{int(mc['🔥'].sum())}", "reponer con urgencia")
 kpi(c[3], "🚀 Lanzamientos", f"{int(mc['🚀'].sum())}", f"altas < {launch}d con tracción")
 kpi(c[4], "A reponer (u)", miles(df_var["Reponer"].sum()), f"{int((mc['Reponer']>0).sum())} modelos+color")
 kpi(c[5], "Quiebres", f"{int(((df_var['Stock']<=0)&(df_var['Vendidos']>0)).sum())}", "vend. con stock 0")
-
+ 
 st.divider()
-
+ 
 # ---------------------------------------------------------------------------
 # ALARMAS
 # ---------------------------------------------------------------------------
 st.subheader("🔔 Alarmas — actuar ahora")
-
-
+ 
+ 
 def card(r, tono, extra=""):
     ac = r["Aceleración"]
     ac_txt = "nuevo" if pd.isna(ac) else f"x{ac:.1f}"
@@ -158,8 +163,8 @@ def card(r, tono, extra=""):
             f"hoy {int(r['Vend_hoy'])} · {reciente}d {int(r['Vend_recientes'])} · "
             f"ritmo {ac_txt} · cob {cov_txt} · "
             f"<b style='color:{NEON}'>reponer {int(r['Reponer'])}</b></div>")
-
-
+ 
+ 
 a1, a2, a3 = st.columns(3)
 with a1:
     st.markdown(f"<h4 style='color:{HOT}'>🔥 Vendiendo rápido</h4>", unsafe_allow_html=True)
@@ -183,9 +188,9 @@ with a3:
         st.caption("Nada por debajo del lead time.")
     for _, r in crit.iterrows():
         st.markdown(card(r, BAD, "SE ACABA ·"), unsafe_allow_html=True)
-
+ 
 st.divider()
-
+ 
 # ---------------------------------------------------------------------------
 # TOP 10 + RITMO
 # ---------------------------------------------------------------------------
@@ -213,9 +218,9 @@ with t2:
         st.plotly_chart(fig2, use_container_width=True)
     else:
         st.info("Sin ventas en la ventana.")
-
+ 
 st.divider()
-
+ 
 # ---------------------------------------------------------------------------
 # BLOQUES POR MARCA
 # ---------------------------------------------------------------------------
@@ -242,9 +247,9 @@ for idx, marca in enumerate(sorted(marcas)):
             f"<span class='pill' style='background:rgba(255,138,61,.18);color:{HOT}'>🔥 {nhot}</span> "
             f"<span class='pill' style='background:rgba(0,229,255,.15);color:{NEON}'>reponer {rep}</span>"
             f"</div>{filas}</div>", unsafe_allow_html=True)
-
+ 
 st.divider()
-
+ 
 # ---------------------------------------------------------------------------
 # TABLA + CURVA
 # ---------------------------------------------------------------------------
@@ -260,8 +265,8 @@ tab["Acel"] = tab["Aceleración"].fillna(0)
 show = tab[["Tienda", "Modelo", "Color", "SKU", "Vendidos", "Vend_hoy", "Acel",
             "Stock", "Cob", "Reponer", "Talles"]].rename(
     columns={"Vend_hoy": "Hoy", "Acel": "Ritmo x", "Cob": "Cobertura d"}).head(400)
-
-
+ 
+ 
 def _sty(df):
     def cov(v):
         if v >= 9999: return "color:#5b6b7d"
@@ -273,14 +278,14 @@ def _sty(df):
             .bar(subset=["Reponer"], color="rgba(168,85,247,.45)")
             .format({"Cobertura d": lambda v: "∞" if v >= 9999 else f"{v:.0f}",
                      "Ritmo x": lambda v: "—" if v == 0 else f"x{v:.1f}"}))
-
-
+ 
+ 
 st.dataframe(_sty(show), use_container_width=True, height=430)
 st.download_button("⬇️ Descargar Excel (reposición)",
                    excel_bytes({"Modelo+Color": mc, "Detalle por talle": df_var}),
                    file_name=f"reposicion_{datetime.now():%Y%m%d_%H%M}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+ 
 st.subheader("📐 Curva de talles")
 opciones = (mc.assign(k=mc["Modelo"] + " · " + mc["Color"] + "  [" + mc["Tienda"] + "]")["k"].tolist())
 sel = st.selectbox("Modelo + color", opciones) if opciones else None
@@ -303,6 +308,8 @@ if sel:
                            margin=dict(l=10, r=10, t=20, b=10), paper_bgcolor="rgba(0,0,0,0)",
                            plot_bgcolor="rgba(0,0,0,0)", legend=dict(orientation="h", y=1.2))
         st.plotly_chart(fig3, use_container_width=True)
-
+ 
 st.caption(f"Actualizado {datetime.now():%d/%m/%Y %H:%M} · base {ventana}d · actual {reciente}d · "
            f"cobertura {cobertura}d · lead {lead}d")
+ 
+
