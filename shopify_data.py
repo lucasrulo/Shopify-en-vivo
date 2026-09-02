@@ -186,20 +186,25 @@ def fetch_variants(store: str, shop_url: str, token: str) -> list[dict]:
     return filas
 
 
-def fetch_sales(store: str, shop_url: str, token: str, days: int):
-    """Unidades e ingresos vendidos por SKU de variante en la ventana, + serie diaria."""
+def fetch_sales(store: str, shop_url: str, token: str, days: int, recent_days: int = 3):
+    """
+    Unidades/ingresos por SKU en la ventana, con sub-ventanas para medir el
+    ritmo ACTUAL (hoy, últimos `recent_days`, últimos 7). Además serie diaria.
+    """
     cli = ShopifyRest(shop_url, token)
+    hoy = datetime.now(timezone.utc).date()
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    por_sku = defaultdict(lambda: {"u": 0, "rev": 0.0})
-    diario = defaultdict(int)  # fecha (date) -> unidades
+    por_sku = defaultdict(lambda: {"u": 0, "u7": 0, "ur": 0, "u1": 0, "rev": 0.0})
+    diario = defaultdict(int)
     for o in cli.paginate("orders.json",
                           {"status": "any", "created_at_min": since, "limit": 250,
                            "fields": "created_at,line_items,financial_status"},
                           "orders"):
         try:
             fecha = datetime.fromisoformat(o["created_at"]).date()
+            dago = (hoy - fecha).days
         except Exception:
-            fecha = None
+            fecha, dago = None, 999
         for li in o.get("line_items") or []:
             sku = (li.get("sku") or "").strip()
             qty = int(li.get("quantity") or 0)
@@ -207,8 +212,15 @@ def fetch_sales(store: str, shop_url: str, token: str, days: int):
                 continue
             price = float(li.get("price") or 0)
             if sku:
-                por_sku[sku]["u"] += qty
-                por_sku[sku]["rev"] += qty * price
+                s = por_sku[sku]
+                s["u"] += qty
+                s["rev"] += qty * price
+                if dago <= 6:
+                    s["u7"] += qty
+                if dago <= recent_days - 1:
+                    s["ur"] += qty
+                if dago <= 0:
+                    s["u1"] += qty
             if fecha:
                 diario[fecha] += qty
     return por_sku, diario
@@ -217,11 +229,11 @@ def fetch_sales(store: str, shop_url: str, token: str, days: int):
 # ---------------------------------------------------------------------------
 # Construcción de la tabla + métricas
 # ---------------------------------------------------------------------------
-def build_variant_table(stores: dict, seleccion: list[str], days: int,
+def build_variant_table(stores: dict, seleccion: list[str], days: int, recent_days: int = 3,
                         progress_cb: Callable[[str, float], None] | None = None):
     """
-    stores: {nombre: {'url':..,'token':..}}. Devuelve:
-      df_var  : DataFrame por variante (con Vendidos, Ingresos)
+    Devuelve:
+      df_var  : DataFrame por variante (Vendidos, Vend_recientes, Vend_hoy, Ingresos, ...)
       serie   : DataFrame diario de unidades por tienda
       errores : list[str]
     """
@@ -235,10 +247,14 @@ def build_variant_table(stores: dict, seleccion: list[str], days: int,
             variantes = fetch_variants(nombre, cfg["url"], cfg["token"])
             if progress_cb:
                 progress_cb(f"{nombre}: ventas…", (i + 0.6) / total)
-            ventas, diario = fetch_sales(nombre, cfg["url"], cfg["token"], days)
+            ventas, diario = fetch_sales(nombre, cfg["url"], cfg["token"], days, recent_days)
+            vacio = {"u": 0, "u7": 0, "ur": 0, "u1": 0, "rev": 0.0}
             for v in variantes:
-                s = ventas.get(v["SKU_variante"], {"u": 0, "rev": 0.0})
+                s = ventas.get(v["SKU_variante"], vacio)
                 v["Vendidos"] = s["u"]
+                v["Vend_7d"] = s["u7"]
+                v["Vend_recientes"] = s["ur"]
+                v["Vend_hoy"] = s["u1"]
                 v["Ingresos"] = round(s["rev"], 2)
                 filas.append(v)
             for f, u in diario.items():
@@ -248,44 +264,76 @@ def build_variant_table(stores: dict, seleccion: list[str], days: int,
         if progress_cb:
             progress_cb(f"{nombre} listo ({i+1}/{total})", (i + 1) / total)
 
-    df_var = pd.DataFrame(filas)
-    serie = pd.DataFrame(serie_rows)
-    return df_var, serie, errores
+    return pd.DataFrame(filas), pd.DataFrame(serie_rows), errores
 
 
-def add_reorder_metrics(df_var: pd.DataFrame, days: int,
-                        coverage_days: int, lead_days: int, safety_pct: int = 0) -> pd.DataFrame:
-    """Agrega velocidad, días de cobertura y sugerido de reposición a nivel variante."""
-    if df_var.empty:
-        return df_var
-    df = df_var.copy()
-    df["Velocidad"] = (df["Vendidos"] / days).round(3)  # u/día
-    objetivo = (coverage_days + lead_days)
+def _dias_desde(iso: str) -> float:
+    try:
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(iso)).days
+    except Exception:
+        return 9999
+
+
+INF = float("inf")
+
+
+def _metricas(df: pd.DataFrame, days: int, recent_days: int,
+              coverage_days: int, lead_days: int, safety_pct: int,
+              accel_thr: float, launch_days: int, min_units: int) -> pd.DataFrame:
+    """Calcula velocidad base/actual, aceleración, cobertura, reposición y flags."""
+    vel_base = df["Vendidos"] / days
+    vel_act = df["Vend_recientes"] / max(1, recent_days)
     factor = 1 + safety_pct / 100.0
-    demanda = df["Velocidad"] * objetivo * factor
+    # se repone según el ritmo más exigente (base vs actual) para reaccionar a picos
+    vel_eff = pd.concat([vel_base, vel_act], axis=1).max(axis=1)
+    demanda = vel_eff * (coverage_days + lead_days) * factor
+    df["Velocidad"] = vel_base.round(3)
+    df["Vel actual"] = vel_act.round(3)
+    df["Aceleración"] = (vel_act / vel_base.replace(0, pd.NA)).astype(float)
     df["Reponer"] = (demanda - df["Stock"]).round().clip(lower=0).astype(int)
-    # días de cobertura: stock / velocidad (inf si no vende)
-    df["Días de cobertura"] = df.apply(
-        lambda r: (r["Stock"] / r["Velocidad"]) if r["Velocidad"] > 0 else float("inf"), axis=1
-    ).round(1)
+    df["Cobertura"] = (df["Stock"] / vel_base.replace(0, pd.NA)).astype(float).round(1)
+    df["Cobertura actual"] = (df["Stock"] / vel_act.replace(0, pd.NA)).astype(float).round(1)
+    if "Creado" in df.columns:
+        df["Días desde alta"] = df["Creado"].map(_dias_desde)
+    else:
+        df["Días desde alta"] = 9999
+    # flags
+    acel = df["Aceleración"]
+    nuevo = df["Días desde alta"] <= launch_days
+    df["🔥"] = ((acel >= accel_thr) & (df["Vend_recientes"] >= min_units)) | \
+               (vel_base.eq(0) & (df["Vend_recientes"] >= min_units))
+    df["🚀"] = nuevo & (df["Vend_recientes"] >= min_units)
     return df
 
 
-def aggregate_model_color(df_var: pd.DataFrame) -> pd.DataFrame:
-    """Colapsa a modelo+color sumando ventas/stock/reponer."""
+def add_reorder_metrics(df_var: pd.DataFrame, days: int, coverage_days: int, lead_days: int,
+                        safety_pct: int = 0, recent_days: int = 3, accel_thr: float = 1.6,
+                        launch_days: int = 30, min_units: int = 3) -> pd.DataFrame:
+    if df_var.empty:
+        return df_var
+    return _metricas(df_var.copy(), days, recent_days, coverage_days, lead_days,
+                     safety_pct, accel_thr, launch_days, min_units)
+
+
+def aggregate_model_color(df_var: pd.DataFrame, days: int, recent_days: int,
+                          coverage_days: int, lead_days: int, safety_pct: int,
+                          accel_thr: float = 1.6, launch_days: int = 30,
+                          min_units: int = 3) -> pd.DataFrame:
+    """Colapsa a modelo+color y recalcula ritmo/aceleración/reposición a ese nivel."""
     if df_var.empty:
         return df_var
     g = (df_var.groupby(["Tienda", "Modelo", "Color", "SKU"], dropna=False)
          .agg(Vendidos=("Vendidos", "sum"),
+              Vend_7d=("Vend_7d", "sum"),
+              Vend_recientes=("Vend_recientes", "sum"),
+              Vend_hoy=("Vend_hoy", "sum"),
               Ingresos=("Ingresos", "sum"),
               Stock=("Stock", "sum"),
-              Reponer=("Reponer", "sum"),
-              Velocidad=("Velocidad", "sum"),
               Precio=("Precio", "max"),
+              Creado=("Creado", "max"),
               Talles=("Talle", lambda s: ", ".join(sorted({x for x in s if x},
                                                            key=lambda z: (len(z), z)))))
          .reset_index())
-    g["Días de cobertura"] = g.apply(
-        lambda r: (r["Stock"] / r["Velocidad"]) if r["Velocidad"] > 0 else float("inf"), axis=1
-    ).round(1)
+    g = _metricas(g, days, recent_days, coverage_days, lead_days,
+                  safety_pct, accel_thr, launch_days, min_units)
     return g.sort_values("Vendidos", ascending=False).reset_index(drop=True)
