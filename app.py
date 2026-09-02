@@ -182,7 +182,7 @@ with a2:
         st.markdown(card(r, NEON2, f"NUEVO {int(r['Días desde alta'])}d ·"), unsafe_allow_html=True)
 with a3:
     st.markdown(f"<h4 style='color:{BAD}'>🚨 Cobertura crítica</h4>", unsafe_allow_html=True)
-    crit = mc[(mc["Vendidos"] > 0) & (mc["Cobertura actual"].fillna(0) < lead)]
+    crit = mc[(mc["Vend_recientes"] > 0) & (mc["Cobertura actual"].fillna(1e9) < lead)]
     crit = crit.sort_values("Cobertura actual").head(10)
     if crit.empty:
         st.caption("Nada por debajo del lead time.")
